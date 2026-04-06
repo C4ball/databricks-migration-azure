@@ -1,0 +1,15 @@
+# Export directories (generated at runtime)
+*-export/
+migration-export/
+export-*/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
