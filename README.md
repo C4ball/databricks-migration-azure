@@ -3,6 +3,7 @@
 Scripts e guia para migração completa de uma Databricks Workspace entre contas/subscriptions Azure, incluindo:
 
 - **Infraestrutura**: VNet injection, Private Endpoints, DNS Zones, NSG
+- **Storage**: ADLS Gen2 (criação de novo storage account, containers, firewall, sync de dados via azcopy)
 - **Dados**: Notebooks, Secret Scopes, Jobs/Workflows
 - **Compatibilidade**: Bash (Linux/macOS) e PowerShell (Windows)
 
@@ -120,6 +121,7 @@ cd scripts\powershell
 - Exporta configuração da workspace (SKU, location, network)
 - Exporta VNet, subnets (com delegations), NSG
 - Exporta Private Endpoints e DNS Zones
+- Exporta ADLS Gen2 storage accounts (containers, SKU, firewall, Access Connectors)
 - Gera `migration_config.json` consolidado
 
 ### Passo 2: Criar Infraestrutura no Destino (`02_create_destino_infra`)
@@ -127,12 +129,15 @@ cd scripts\powershell
 - Cria VNet com mesmas subnets e CIDRs
 - Cria NSG e associa às subnets
 - Cria Workspace Databricks com VNet injection
+- Cria **novo ADLS Gen2** com mesma config (SKU, HNS, containers, firewall)
+- Cria Access Connector para Unity Catalog com role assignments
 - Cria Private Endpoint com DNS Zone
 
 ### Passo 3: Migrar Dados (`03_migrate_data`)
 - **Notebooks**: export-dir / import-dir recursivo
 - **Secret Scopes**: recria scopes e secrets (valores via arquivo JSON ou placeholder)
 - **Jobs**: exporta, limpa campos read-only, recria com mapeamento de IDs
+- **Storage** (opcional): sincroniza dados entre storage accounts via `azcopy sync`
 
 ## Flags Úteis
 
@@ -141,6 +146,8 @@ cd scripts\powershell
 | Dry run | `--dry-run` | `-DryRun` | Mostra plano sem executar |
 | Pular infra | `--skip-infra` | `-SkipInfra` | Só migra dados |
 | Pular dados | `--skip-data` | `-SkipData` | Só cria infra |
+| Sync storage | `--sync-storage` | `-SyncStorage` | Sincroniza dados ADLS Gen2 via azcopy |
+| Storage name | `--destino-storage-name` | `-DestinoStorageName` | Nome custom para storage destino |
 | Help | `--help` | `Get-Help .\migrate.ps1` | Documentação completa |
 
 ## Formato do Arquivo de Secrets
