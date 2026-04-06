@@ -47,11 +47,11 @@ echo " Output: $OUTPUT_DIR"
 echo "============================================"
 
 # ===================== SET SUBSCRIPTION =====================
-echo "[1/7] Definindo subscription..."
+echo "[1/9] Definindo subscription..."
 az account set --subscription "$SUBSCRIPTION"
 
 # ===================== EXPORT WORKSPACE =====================
-echo "[2/7] Exportando workspace..."
+echo "[2/9] Exportando workspace..."
 az databricks workspace show \
   --resource-group "$RESOURCE_GROUP" \
   --name "$WORKSPACE_NAME" \
@@ -81,7 +81,7 @@ VNET_NAME=""
 VNET_ADDRESS_SPACE=""
 if [[ "$HAS_VNET_INJECTION" == "true" ]]; then
   VNET_NAME=$(echo "$VNET_ID" | awk -F'/' '{print $NF}')
-  echo "[3/7] Exportando VNet: $VNET_NAME ..."
+  echo "[3/9] Exportando VNet: $VNET_NAME ..."
   az network vnet show \
     --resource-group "$RESOURCE_GROUP" \
     --name "$VNET_NAME" \
@@ -89,14 +89,14 @@ if [[ "$HAS_VNET_INJECTION" == "true" ]]; then
   VNET_ADDRESS_SPACE=$(jq -r '.addressSpace.addressPrefixes[0]' "$OUTPUT_DIR/vnet.json")
 
   # ===================== EXPORT SUBNETS =====================
-  echo "[4/7] Exportando subnets..."
+  echo "[4/9] Exportando subnets..."
   az network vnet subnet list \
     --resource-group "$RESOURCE_GROUP" \
     --vnet-name "$VNET_NAME" \
     --output json > "$OUTPUT_DIR/subnets.json"
 
   # ===================== EXPORT NSG =====================
-  echo "[5/7] Exportando NSGs..."
+  echo "[5/9] Exportando NSGs..."
   # Detectar NSGs associados as subnets
   NSG_IDS=$(jq -r '.[].networkSecurityGroup.id // empty' "$OUTPUT_DIR/subnets.json" | sort -u | grep -v '^$' || true)
   NSG_NAMES=()
@@ -112,13 +112,119 @@ if [[ "$HAS_VNET_INJECTION" == "true" ]]; then
     idx=$((idx + 1))
   done
 else
-  echo "[3/7] Sem VNet injection - pulando VNet..."
-  echo "[4/7] Sem VNet injection - pulando subnets..."
-  echo "[5/7] Sem VNet injection - pulando NSG..."
+  echo "[3/9] Sem VNet injection - pulando VNet..."
+  echo "[4/9] Sem VNet injection - pulando subnets..."
+  echo "[5/9] Sem VNet injection - pulando NSG..."
 fi
 
+# ===================== EXPORT ADLS GEN2 STORAGE ACCOUNTS =====================
+echo "[6/9] Exportando ADLS Gen2 Storage Accounts..."
+
+# Find storage accounts with HNS enabled (ADLS Gen2) in the resource group
+STORAGE_ACCOUNTS_JSON=$(az storage account list \
+  --resource-group "$RESOURCE_GROUP" \
+  --query "[?isHnsEnabled==\`true\`]" \
+  --output json 2>/dev/null || echo "[]")
+
+STORAGE_COUNT=$(echo "$STORAGE_ACCOUNTS_JSON" | jq 'length')
+HAS_ADLS_STORAGE="false"
+STORAGE_CONFIGS="[]"
+
+if [[ "$STORAGE_COUNT" -gt 0 ]]; then
+  HAS_ADLS_STORAGE="true"
+  echo "  Encontradas $STORAGE_COUNT storage account(s) ADLS Gen2"
+
+  echo "$STORAGE_ACCOUNTS_JSON" > "$OUTPUT_DIR/storage_accounts.json"
+
+  STORAGE_CONFIGS="["
+  for i in $(seq 0 $((STORAGE_COUNT - 1))); do
+    SA_NAME=$(echo "$STORAGE_ACCOUNTS_JSON" | jq -r ".[$i].name")
+    SA_SKU=$(echo "$STORAGE_ACCOUNTS_JSON" | jq -r ".[$i].sku.name")
+    SA_KIND=$(echo "$STORAGE_ACCOUNTS_JSON" | jq -r ".[$i].kind")
+    SA_ACCESS_TIER=$(echo "$STORAGE_ACCOUNTS_JSON" | jq -r ".[$i].accessTier // \"Hot\"")
+    SA_HNS=$(echo "$STORAGE_ACCOUNTS_JSON" | jq -r ".[$i].isHnsEnabled")
+
+    echo "  Storage Account: $SA_NAME (SKU: $SA_SKU, Kind: $SA_KIND, Tier: $SA_ACCESS_TIER)"
+
+    # Export containers
+    CONTAINERS_JSON=$(az storage container list \
+      --account-name "$SA_NAME" \
+      --auth-mode login \
+      --output json 2>/dev/null || echo "[]")
+    CONTAINER_NAMES=$(echo "$CONTAINERS_JSON" | jq -r '[.[].name]')
+    echo "    Containers: $(echo "$CONTAINERS_JSON" | jq 'length')"
+
+    # Export CORS rules
+    CORS_JSON=$(az storage cors list \
+      --account-name "$SA_NAME" \
+      --services b \
+      --auth-mode login \
+      --output json 2>/dev/null || echo "[]")
+
+    # Export network rules
+    NETWORK_RULES_JSON=$(az storage account network-rule list \
+      --account-name "$SA_NAME" \
+      --resource-group "$RESOURCE_GROUP" \
+      --output json 2>/dev/null || echo "{}")
+    DEFAULT_ACTION=$(echo "$STORAGE_ACCOUNTS_JSON" | jq -r ".[$i].networkRuleSet.defaultAction // \"Allow\"")
+
+    echo "    Network default action: $DEFAULT_ACTION"
+
+    # Build storage config entry
+    [[ $i -gt 0 ]] && STORAGE_CONFIGS="$STORAGE_CONFIGS,"
+    STORAGE_CONFIGS="$STORAGE_CONFIGS
+    {
+      \"name\": \"$SA_NAME\",
+      \"sku\": \"$SA_SKU\",
+      \"kind\": \"$SA_KIND\",
+      \"accessTier\": \"$SA_ACCESS_TIER\",
+      \"isHnsEnabled\": $SA_HNS,
+      \"containers\": $CONTAINER_NAMES,
+      \"cors\": $CORS_JSON,
+      \"networkDefaultAction\": \"$DEFAULT_ACTION\",
+      \"networkRules\": $NETWORK_RULES_JSON
+    }"
+  done
+  STORAGE_CONFIGS="$STORAGE_CONFIGS
+  ]"
+else
+  echo "  Nenhuma storage account ADLS Gen2 encontrada no Resource Group"
+fi
+
+# ===================== EXPORT ACCESS CONNECTORS =====================
+echo "[7/9] Exportando Access Connectors para Databricks..."
+
+ACCESS_CONNECTORS_JSON=$(az resource list \
+  --resource-group "$RESOURCE_GROUP" \
+  --resource-type "Microsoft.Databricks/accessConnectors" \
+  --output json 2>/dev/null || echo "[]")
+
+AC_COUNT=$(echo "$ACCESS_CONNECTORS_JSON" | jq 'length')
+HAS_ACCESS_CONNECTOR="false"
+AC_CONFIGS="[]"
+
+if [[ "$AC_COUNT" -gt 0 ]]; then
+  HAS_ACCESS_CONNECTOR="true"
+  echo "  Encontrados $AC_COUNT Access Connector(s)"
+  echo "$ACCESS_CONNECTORS_JSON" > "$OUTPUT_DIR/access_connectors.json"
+
+  AC_CONFIGS=$(echo "$ACCESS_CONNECTORS_JSON" | jq '[.[] | {
+    name: .name,
+    location: .location,
+    identity: .identity
+  }]')
+else
+  echo "  Nenhum Access Connector encontrado"
+fi
+
+# ===================== EXPORT MOUNT POINTS (via Databricks CLI) =====================
+MOUNTS_JSON="[]"
+# Note: mount points can only be exported if Databricks CLI is configured for the source
+# This is a best-effort export - mounts require cluster execution to list
+echo "  (Mount points devem ser verificados manualmente via dbutils.fs.mounts())"
+
 # ===================== EXPORT PRIVATE ENDPOINTS =====================
-echo "[6/7] Exportando Private Endpoints..."
+echo "[8/9] Exportando Private Endpoints..."
 WS_RESOURCE_ID=$(jq -r '.id' "$OUTPUT_DIR/workspace.json")
 PE_LIST=$(az network private-endpoint list \
   --resource-group "$RESOURCE_GROUP" \
@@ -151,7 +257,7 @@ else
 fi
 
 # ===================== GERAR CONFIG CONSOLIDADA =====================
-echo "[7/7] Gerando config consolidada..."
+echo "[9/9] Gerando config consolidada..."
 
 # Montar subnets config
 SUBNETS_JSON="[]"
@@ -193,6 +299,13 @@ cat > "$OUTPUT_DIR/migration_config.json" << JSONEOF
   },
   "privateDns": {
     "zoneName": "privatelink.azuredatabricks.net"
+  },
+  "storage": {
+    "hasAdlsGen2": $HAS_ADLS_STORAGE,
+    "storageAccounts": $STORAGE_CONFIGS,
+    "hasAccessConnector": $HAS_ACCESS_CONNECTOR,
+    "accessConnectors": $AC_CONFIGS,
+    "mountPoints": $MOUNTS_JSON
   }
 }
 JSONEOF

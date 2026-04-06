@@ -56,11 +56,11 @@ Write-Host " Output: $OutputDir"
 Write-Host "============================================"
 
 # ===================== SET SUBSCRIPTION =====================
-Write-Host "[1/7] Definindo subscription..."
+Write-Host "[1/9] Definindo subscription..."
 az account set --subscription $Subscription
 
 # ===================== EXPORT WORKSPACE =====================
-Write-Host "[2/7] Exportando workspace..."
+Write-Host "[2/9] Exportando workspace..."
 az databricks workspace show `
     --resource-group $ResourceGroup `
     --name $WorkspaceName `
@@ -94,7 +94,7 @@ $NsgNames = @()
 
 if ($HasVnetInjection) {
     $VnetName = ($VnetId -split '/')[-1]
-    Write-Host "[3/7] Exportando VNet: $VnetName ..."
+    Write-Host "[3/9] Exportando VNet: $VnetName ..."
     az network vnet show `
         --resource-group $ResourceGroup `
         --name $VnetName `
@@ -104,14 +104,14 @@ if ($HasVnetInjection) {
     $VnetAddressSpace = $vnetJson.addressSpace.addressPrefixes[0]
 
     # ===================== EXPORT SUBNETS =====================
-    Write-Host "[4/7] Exportando subnets..."
+    Write-Host "[4/9] Exportando subnets..."
     az network vnet subnet list `
         --resource-group $ResourceGroup `
         --vnet-name $VnetName `
         --output json | Out-File -FilePath "$OutputDir/subnets.json" -Encoding utf8
 
     # ===================== EXPORT NSG =====================
-    Write-Host "[5/7] Exportando NSGs..."
+    Write-Host "[5/9] Exportando NSGs..."
     $subnetsJson = Get-Content "$OutputDir/subnets.json" -Raw | ConvertFrom-Json
 
     # Detectar NSGs associados as subnets
@@ -136,13 +136,142 @@ if ($HasVnetInjection) {
     }
 }
 else {
-    Write-Host "[3/7] Sem VNet injection - pulando VNet..."
-    Write-Host "[4/7] Sem VNet injection - pulando subnets..."
-    Write-Host "[5/7] Sem VNet injection - pulando NSG..."
+    Write-Host "[3/9] Sem VNet injection - pulando VNet..."
+    Write-Host "[4/9] Sem VNet injection - pulando subnets..."
+    Write-Host "[5/9] Sem VNet injection - pulando NSG..."
 }
 
+# ===================== EXPORT ADLS GEN2 STORAGE ACCOUNTS =====================
+Write-Host "[6/9] Exportando ADLS Gen2 Storage Accounts..."
+
+# Find storage accounts with HNS enabled (ADLS Gen2) in the resource group
+$HasAdlsStorage = $false
+$StorageConfigs = @()
+
+try {
+    $storageAccountsRaw = az storage account list `
+        --resource-group $ResourceGroup `
+        --query "[?isHnsEnabled==``true``]" `
+        --output json 2>$null
+    $storageAccounts = $storageAccountsRaw | ConvertFrom-Json
+}
+catch {
+    $storageAccounts = @()
+}
+
+if ($storageAccounts -and $storageAccounts.Count -gt 0) {
+    $HasAdlsStorage = $true
+    Write-Host "  Encontradas $($storageAccounts.Count) storage account(s) ADLS Gen2"
+
+    $storageAccountsRaw | Out-File -FilePath "$OutputDir/storage_accounts.json" -Encoding utf8
+
+    foreach ($sa in $storageAccounts) {
+        $saName = $sa.name
+        $saSku = $sa.sku.name
+        $saKind = $sa.kind
+        $saAccessTier = if ($sa.accessTier) { $sa.accessTier } else { "Hot" }
+        $saHns = $sa.isHnsEnabled
+
+        Write-Host "  Storage Account: $saName (SKU: $saSku, Kind: $saKind, Tier: $saAccessTier)"
+
+        # Export containers
+        $containerNames = @()
+        try {
+            $containersRaw = az storage container list `
+                --account-name $saName `
+                --auth-mode login `
+                --output json 2>$null
+            $containers = $containersRaw | ConvertFrom-Json
+            $containerNames = @($containers | ForEach-Object { $_.name })
+            Write-Host "    Containers: $($containerNames.Count)"
+        }
+        catch {
+            Write-Host "    Containers: erro ao listar"
+        }
+
+        # Export CORS rules
+        $corsRules = @()
+        try {
+            $corsRaw = az storage cors list `
+                --account-name $saName `
+                --services b `
+                --auth-mode login `
+                --output json 2>$null
+            $corsRules = $corsRaw | ConvertFrom-Json
+        }
+        catch { }
+
+        # Export network rules
+        $networkRules = @{}
+        $defaultAction = "Allow"
+        try {
+            $networkRulesRaw = az storage account network-rule list `
+                --account-name $saName `
+                --resource-group $ResourceGroup `
+                --output json 2>$null
+            $networkRules = $networkRulesRaw | ConvertFrom-Json
+            $defaultAction = if ($sa.networkRuleSet -and $sa.networkRuleSet.defaultAction) { $sa.networkRuleSet.defaultAction } else { "Allow" }
+        }
+        catch { }
+
+        Write-Host "    Network default action: $defaultAction"
+
+        $StorageConfigs += @{
+            name                 = $saName
+            sku                  = $saSku
+            kind                 = $saKind
+            accessTier           = $saAccessTier
+            isHnsEnabled         = $saHns
+            containers           = $containerNames
+            cors                 = $corsRules
+            networkDefaultAction = $defaultAction
+            networkRules         = $networkRules
+        }
+    }
+}
+else {
+    Write-Host "  Nenhuma storage account ADLS Gen2 encontrada no Resource Group"
+}
+
+# ===================== EXPORT ACCESS CONNECTORS =====================
+Write-Host "[7/9] Exportando Access Connectors para Databricks..."
+
+$HasAccessConnector = $false
+$AcConfigs = @()
+
+try {
+    $acRaw = az resource list `
+        --resource-group $ResourceGroup `
+        --resource-type "Microsoft.Databricks/accessConnectors" `
+        --output json 2>$null
+    $accessConnectors = $acRaw | ConvertFrom-Json
+}
+catch {
+    $accessConnectors = @()
+}
+
+if ($accessConnectors -and $accessConnectors.Count -gt 0) {
+    $HasAccessConnector = $true
+    Write-Host "  Encontrados $($accessConnectors.Count) Access Connector(s)"
+    $acRaw | Out-File -FilePath "$OutputDir/access_connectors.json" -Encoding utf8
+
+    foreach ($ac in $accessConnectors) {
+        $AcConfigs += @{
+            name     = $ac.name
+            location = $ac.location
+            identity = $ac.identity
+        }
+    }
+}
+else {
+    Write-Host "  Nenhum Access Connector encontrado"
+}
+
+# Mount points note
+Write-Host "  (Mount points devem ser verificados manualmente via dbutils.fs.mounts())"
+
 # ===================== EXPORT PRIVATE ENDPOINTS =====================
-Write-Host "[6/7] Exportando Private Endpoints..."
+Write-Host "[8/9] Exportando Private Endpoints..."
 $WsResourceId = $wsJson.id
 
 $HasPrivateEndpoint = $false
@@ -192,7 +321,7 @@ else {
 }
 
 # ===================== GERAR CONFIG CONSOLIDADA =====================
-Write-Host "[7/7] Gerando config consolidada..."
+Write-Host "[9/9] Gerando config consolidada..."
 
 # Montar subnets config
 $SubnetsArray = @()
@@ -242,6 +371,13 @@ $migrationConfig = @{
     }
     privateDns      = @{
         zoneName = "privatelink.azuredatabricks.net"
+    }
+    storage         = @{
+        hasAdlsGen2        = $HasAdlsStorage
+        storageAccounts    = $StorageConfigs
+        hasAccessConnector = $HasAccessConnector
+        accessConnectors   = $AcConfigs
+        mountPoints        = @()
     }
 }
 

@@ -25,6 +25,8 @@
 #       [--destino-vnet-address-space <cidr>] \
 #       [--secrets-file <path>] \
 #       [--export-dir <path>] \
+#       [--destino-storage-name <name>]  # nome custom para storage account destino
+#       [--sync-storage]      # habilita sincronizacao de storage ADLS Gen2
 #       [--skip-infra]        # Pula criacao de infra (se ja foi criada)
 #       [--skip-data]         # Pula migracao de dados
 #       [--dry-run]           # Apenas mostra o que seria feito
@@ -75,6 +77,8 @@ DESTINO_VNET_CIDR=""
 
 SECRETS_FILE=""
 EXPORT_DIR="${SCRIPT_DIR}/export-$(date +%Y%m%d-%H%M%S)"
+DESTINO_STORAGE_NAME=""
+SYNC_STORAGE=false
 SKIP_INFRA=false
 SKIP_DATA=false
 DRY_RUN=false
@@ -99,6 +103,10 @@ PARAMETROS OPCIONAIS - DESTINO:
   --destino-vnet-name <name>       Nome da VNet no destino (default: vnet-<workspace>)
   --destino-location <region>      Regiao Azure (default: herda da origem)
   --destino-vnet-address-space <c> CIDR da VNet (default: herda da origem)
+
+PARAMETROS OPCIONAIS - STORAGE:
+  --destino-storage-name <name>    Nome custom para storage account destino
+  --sync-storage                   Habilita sincronizacao de dados ADLS Gen2
 
 PARAMETROS OPCIONAIS - GERAL:
   --secrets-file <path>            JSON com valores dos secrets para migrar
@@ -133,6 +141,8 @@ while [[ $# -gt 0 ]]; do
     --destino-vnet-address-space) DESTINO_VNET_CIDR="$2"; shift 2;;
     --secrets-file)             SECRETS_FILE="$2"; shift 2;;
     --export-dir)               EXPORT_DIR="$2"; shift 2;;
+    --destino-storage-name)     DESTINO_STORAGE_NAME="$2"; shift 2;;
+    --sync-storage)             SYNC_STORAGE=true; shift;;
     --skip-infra)               SKIP_INFRA=true; shift;;
     --skip-data)                SKIP_DATA=true; shift;;
     --dry-run)                  DRY_RUN=true; shift;;
@@ -198,6 +208,8 @@ echo ""
 echo "  OPCOES:"
 echo "    Export Dir:     $EXPORT_DIR"
 echo "    Secrets File:   ${SECRETS_FILE:-nao fornecido}"
+echo "    Storage Name:   ${DESTINO_STORAGE_NAME:-auto}"
+echo "    Sync Storage:   $SYNC_STORAGE"
 echo "    Skip Infra:     $SKIP_INFRA"
 echo "    Skip Data:      $SKIP_DATA"
 echo "    Dry Run:        $DRY_RUN"
@@ -224,6 +236,7 @@ if [[ "$DRY_RUN" == "true" ]]; then
     [[ -n "$DESTINO_VNET" ]] && echo "       --vnet-name $DESTINO_VNET"
     [[ -n "$DESTINO_LOCATION" ]] && echo "       --location $DESTINO_LOCATION"
     [[ -n "$DESTINO_VNET_CIDR" ]] && echo "       --vnet-address-space $DESTINO_VNET_CIDR"
+    [[ -n "$DESTINO_STORAGE_NAME" ]] && echo "       --storage-name $DESTINO_STORAGE_NAME"
     echo ""
   fi
   if [[ "$SKIP_DATA" != "true" ]]; then
@@ -233,6 +246,7 @@ if [[ "$DRY_RUN" == "true" ]]; then
     echo "       --profile-destino $DESTINO_PROFILE"
     echo "       --export-dir $DATA_DIR"
     [[ -n "$SECRETS_FILE" ]] && echo "       --secrets-file $SECRETS_FILE"
+    [[ "$SYNC_STORAGE" == "true" ]] && echo "       --sync-storage"
   fi
   echo ""
   echo "  [DRY RUN] Nenhuma acao executada."
@@ -274,9 +288,10 @@ if [[ "$SKIP_INFRA" != "true" ]]; then
     --workspace-name "$DESTINO_WS"
     --cli-profile "$DESTINO_PROFILE"
   )
-  [[ -n "$DESTINO_VNET" ]]      && CREATE_CMD+=(--vnet-name "$DESTINO_VNET")
-  [[ -n "$DESTINO_LOCATION" ]]  && CREATE_CMD+=(--location "$DESTINO_LOCATION")
-  [[ -n "$DESTINO_VNET_CIDR" ]] && CREATE_CMD+=(--vnet-address-space "$DESTINO_VNET_CIDR")
+  [[ -n "$DESTINO_VNET" ]]          && CREATE_CMD+=(--vnet-name "$DESTINO_VNET")
+  [[ -n "$DESTINO_LOCATION" ]]      && CREATE_CMD+=(--location "$DESTINO_LOCATION")
+  [[ -n "$DESTINO_VNET_CIDR" ]]     && CREATE_CMD+=(--vnet-address-space "$DESTINO_VNET_CIDR")
+  [[ -n "$DESTINO_STORAGE_NAME" ]]  && CREATE_CMD+=(--storage-name "$DESTINO_STORAGE_NAME")
 
   "${CREATE_CMD[@]}"
 else
@@ -297,6 +312,7 @@ if [[ "$SKIP_DATA" != "true" ]]; then
     --export-dir "$DATA_DIR"
   )
   [[ -n "$SECRETS_FILE" ]] && MIGRATE_CMD+=(--secrets-file "$SECRETS_FILE")
+  [[ "$SYNC_STORAGE" == "true" ]] && MIGRATE_CMD+=(--sync-storage)
 
   "${MIGRATE_CMD[@]}"
 else
@@ -328,4 +344,6 @@ echo "    3. Executar um job de teste no DESTINO"
 echo "    4. Configurar scheduling dos jobs"
 echo "    5. Atualizar DNS/bookmarks para nova workspace"
 echo "    6. Pausar jobs na ORIGEM apos validacao"
+echo "    7. Validar dados no storage destino (se sincronizado)"
+echo "    8. Atualizar mount points/external locations no DESTINO"
 echo "################################################################"

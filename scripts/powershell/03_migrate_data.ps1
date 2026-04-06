@@ -21,6 +21,15 @@
     Optional JSON file with secret values for migration.
     Format: {"scope_name": {"key1": "valor1", "key2": "valor2"}}
 
+.PARAMETER SyncStorage
+    Switch to enable ADLS Gen2 storage data synchronization.
+
+.PARAMETER OrigemStorageAccount
+    Source storage account name for data sync.
+
+.PARAMETER DestinoStorageAccount
+    Destination storage account name for data sync.
+
 .EXAMPLE
     .\03_migrate_data.ps1 `
         -ProfileOrigem "prod-origem" `
@@ -38,7 +47,13 @@ param(
 
     [string]$ExportDir = "./migration-export",
 
-    [string]$SecretsFile = ""
+    [string]$SecretsFile = "",
+
+    [switch]$SyncStorage,
+
+    [string]$OrigemStorageAccount = "",
+
+    [string]$DestinoStorageAccount = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -60,7 +75,7 @@ Write-Host "============================================"
 Write-Host ""
 
 # ===================== VALIDAR CONECTIVIDADE =====================
-Write-Host "[0/6] Validando conectividade..."
+Write-Host "[0/8] Validando conectividade..."
 
 $origemEnvRaw = databricks auth env --profile $ProfileOrigem 2>$null
 $origemEnv = $origemEnvRaw | ConvertFrom-Json
@@ -100,7 +115,7 @@ Write-Host "============================================"
 Write-Host " FASE 1: Migrar Notebooks"
 Write-Host "============================================"
 
-Write-Host "[1/6] Exportando notebooks da ORIGEM..."
+Write-Host "[1/8] Exportando notebooks da ORIGEM..."
 $exportOutput = databricks workspace export-dir / "$ExportDir/notebooks" `
     --profile $ProfileOrigem `
     --overwrite 2>&1
@@ -112,7 +127,7 @@ $notebookFiles = Get-ChildItem -Path "$ExportDir/notebooks" -Recurse -File -Incl
 $NotebookCount = if ($notebookFiles) { $notebookFiles.Count } else { 0 }
 Write-Host "  Exportados: $NotebookCount notebooks"
 
-Write-Host "[2/6] Importando notebooks no DESTINO..."
+Write-Host "[2/8] Importando notebooks no DESTINO..."
 $importOutput = databricks workspace import-dir "$ExportDir/notebooks" / `
     --profile $ProfileDestino `
     --overwrite 2>&1
@@ -144,7 +159,7 @@ Write-Host "============================================"
 Write-Host " FASE 2: Migrar Secret Scopes"
 Write-Host "============================================"
 
-Write-Host "[3/6] Exportando secret scopes da ORIGEM..."
+Write-Host "[3/8] Exportando secret scopes da ORIGEM..."
 try {
     databricks secrets list-scopes --profile $ProfileOrigem --output json | Out-File -FilePath "$ExportDir/secrets/scopes.json" -Encoding utf8 2>$null
 }
@@ -255,7 +270,7 @@ Write-Host "============================================"
 Write-Host " FASE 3: Migrar Jobs"
 Write-Host "============================================"
 
-Write-Host "[4/6] Exportando jobs da ORIGEM..."
+Write-Host "[4/8] Exportando jobs da ORIGEM..."
 try {
     databricks jobs list --profile $ProfileOrigem --output json | Out-File -FilePath "$ExportDir/jobs/jobs_list.json" -Encoding utf8 2>$null
 }
@@ -284,7 +299,7 @@ if ($JobCount -gt 0) {
         if ($job.job_id) { $jobIds += $job.job_id }
     }
 
-    Write-Host "[5/6] Exportando definicoes completas dos jobs..."
+    Write-Host "[5/8] Exportando definicoes completas dos jobs..."
     foreach ($jobId in $jobIds) {
         if ($jobId) {
             databricks jobs get $jobId --profile $ProfileOrigem --output json | Out-File -FilePath "$ExportDir/jobs/job_${jobId}.json" -Encoding utf8 2>$null
@@ -294,7 +309,7 @@ if ($JobCount -gt 0) {
         }
     }
 
-    Write-Host "[6/6] Limpando e recriando jobs no DESTINO..."
+    Write-Host "[6/8] Limpando e recriando jobs no DESTINO..."
     foreach ($jobId in $jobIds) {
         $jobFilePath = "$ExportDir/jobs/job_${jobId}.json"
         if ($jobId -and (Test-Path $jobFilePath)) {
@@ -365,8 +380,170 @@ if ($JobCount -gt 0) {
     }
 }
 else {
-    Write-Host "[5/6] Nenhum job para exportar."
-    Write-Host "[6/6] Pulando..."
+    Write-Host "[5/8] Nenhum job para exportar."
+    Write-Host "[6/8] Pulando..."
+}
+
+###########################################################################
+# FASE 4: STORAGE SYNC (ADLS Gen2)
+###########################################################################
+$StorageSyncStatus = "Pulado (-SyncStorage nao fornecido)"
+$StorageSyncBytes = ""
+
+if ($SyncStorage) {
+    Write-Host "============================================"
+    Write-Host " FASE 4: Sincronizar Storage ADLS Gen2"
+    Write-Host "============================================"
+
+    if (-not $OrigemStorageAccount -or -not $DestinoStorageAccount) {
+        Write-Host "  ERRO: -OrigemStorageAccount e -DestinoStorageAccount sao obrigatorios com -SyncStorage" -ForegroundColor Red
+        Write-Host "  Pulando sincronizacao de storage..."
+        $StorageSyncStatus = "Erro: parametros de storage nao fornecidos"
+    }
+    else {
+        Write-Host "[7/8] Listando containers e tamanhos na ORIGEM..."
+        $storagePath = Join-Path $ExportDir "storage"
+        if (-not (Test-Path $storagePath)) {
+            New-Item -ItemType Directory -Path $storagePath -Force | Out-Null
+        }
+
+        # List containers in source
+        $containers = @()
+        try {
+            $containersRaw = az storage container list `
+                --account-name $OrigemStorageAccount `
+                --auth-mode login `
+                --query "[].name" -o tsv 2>$null
+            if ($containersRaw) {
+                $containers = $containersRaw -split "`n" | Where-Object { $_.Trim() -ne "" }
+            }
+        }
+        catch { }
+
+        if ($containers.Count -eq 0) {
+            Write-Host "  Nenhum container encontrado na storage de origem."
+            $StorageSyncStatus = "Nenhum container encontrado"
+        }
+        else {
+            Write-Host "  Containers encontrados:"
+            $totalSize = 0
+            foreach ($container in $containers) {
+                $container = $container.Trim()
+                # Get container size (best effort)
+                $size = 0
+                try {
+                    $blobSizes = az storage blob list `
+                        --account-name $OrigemStorageAccount `
+                        --container-name $container `
+                        --auth-mode login `
+                        --query "[].properties.contentLength" -o tsv 2>$null
+                    if ($blobSizes) {
+                        $blobSizes -split "`n" | ForEach-Object {
+                            if ($_.Trim() -ne "") { $size += [long]$_.Trim() }
+                        }
+                    }
+                }
+                catch { }
+                $sizeMB = [math]::Floor($size / 1024 / 1024)
+                Write-Host "    ${container}: ${sizeMB} MB"
+                $totalSize += $size
+            }
+            $totalSizeGB = [math]::Floor($totalSize / 1024 / 1024 / 1024)
+            Write-Host "  Total estimado: ${totalSizeGB} GB"
+            Write-Host ""
+
+            Write-Host "[8/8] Sincronizando dados com azcopy..."
+            Write-Host "  Origem:  $OrigemStorageAccount"
+            Write-Host "  Destino: $DestinoStorageAccount"
+            Write-Host ""
+
+            # Determine authentication method
+            # Try Azure AD auth first (azcopy login), fallback to SAS tokens
+            $azcopyAuth = "aad"
+            try {
+                $testResult = azcopy list "https://${OrigemStorageAccount}.blob.core.windows.net/" 2>$null
+                if (-not $?) { throw "azcopy AAD auth failed" }
+            }
+            catch {
+                Write-Host "  Azure AD auth nao disponivel para azcopy, tentando SAS tokens..."
+                $azcopyAuth = "sas"
+
+                # Generate SAS tokens for source (read) and destination (write)
+                $sasExpiry = (Get-Date).AddHours(24).ToUniversalTime().ToString("yyyy-MM-ddTHH:mmZ")
+
+                try {
+                    $origemSas = az storage account generate-sas `
+                        --account-name $OrigemStorageAccount `
+                        --permissions rl `
+                        --services b `
+                        --resource-types co `
+                        --expiry $sasExpiry `
+                        -o tsv 2>$null
+
+                    $destinoSas = az storage account generate-sas `
+                        --account-name $DestinoStorageAccount `
+                        --permissions rwdlac `
+                        --services b `
+                        --resource-types co `
+                        --expiry $sasExpiry `
+                        -o tsv 2>$null
+                }
+                catch {
+                    $origemSas = ""
+                    $destinoSas = ""
+                }
+
+                if (-not $origemSas -or -not $destinoSas) {
+                    Write-Host "  ERRO: Nao foi possivel gerar SAS tokens. Verifique permissoes." -ForegroundColor Red
+                    $StorageSyncStatus = "Erro: falha ao gerar SAS tokens"
+                    $SyncStorage = $false
+                }
+            }
+
+            if ($SyncStorage) {
+                $syncErrors = 0
+                $syncSuccess = 0
+
+                foreach ($container in $containers) {
+                    $container = $container.Trim()
+                    Write-Host ""
+                    Write-Host "  Sincronizando container: $container ..."
+
+                    if ($azcopyAuth -eq "aad") {
+                        $srcUrl = "https://${OrigemStorageAccount}.blob.core.windows.net/${container}"
+                        $dstUrl = "https://${DestinoStorageAccount}.blob.core.windows.net/${container}"
+                    }
+                    else {
+                        $srcUrl = "https://${OrigemStorageAccount}.blob.core.windows.net/${container}?${origemSas}"
+                        $dstUrl = "https://${DestinoStorageAccount}.blob.core.windows.net/${container}?${destinoSas}"
+                    }
+
+                    $logFile = Join-Path $storagePath "azcopy_${container}.log"
+                    try {
+                        $azcopyOutput = azcopy sync $srcUrl $dstUrl --recursive=true 2>&1
+                        $azcopyOutput | Out-File -FilePath $logFile -Encoding utf8
+                        $azcopyOutput | Select-Object -Last 5 | ForEach-Object { Write-Host $_ }
+                        $syncSuccess++
+                        Write-Host "    Container ${container}: OK"
+                    }
+                    catch {
+                        $syncErrors++
+                        Write-Host "    Container ${container}: ERRO (ver log: $logFile)" -ForegroundColor Red
+                    }
+                }
+
+                $StorageSyncStatus = "Completo (sucesso: $syncSuccess, erros: $syncErrors)"
+                $StorageSyncBytes = "${totalSizeGB} GB transferidos (estimado)"
+            }
+        }
+    }
+}
+else {
+    Write-Host ""
+    Write-Host "============================================"
+    Write-Host " FASE 4: Sincronizar Storage ADLS Gen2"
+    Write-Host "============================================"
+    Write-Host "  Pulado (use -SyncStorage para habilitar)"
 }
 
 ###########################################################################
@@ -405,6 +582,17 @@ if (Test-Path $mappingFile) {
     }
 }
 Write-Host ""
+Write-Host " STORAGE SYNC:"
+Write-Host "   Status: $StorageSyncStatus"
+if ($StorageSyncBytes) {
+    Write-Host "   Volume: $StorageSyncBytes"
+}
+if ($SyncStorage -and $OrigemStorageAccount) {
+    Write-Host "   Origem:  $OrigemStorageAccount"
+    Write-Host "   Destino: $DestinoStorageAccount"
+    Write-Host "   Logs:    $(Join-Path $ExportDir 'storage')/"
+}
+Write-Host ""
 Write-Host " Arquivos exportados em: $ExportDir/"
 Write-Host ""
 Write-Host " Proximos passos:"
@@ -412,4 +600,7 @@ Write-Host "   1. Atualizar valores de secrets com os valores reais"
 Write-Host "   2. Validar notebooks importados no DESTINO"
 Write-Host "   3. Executar um job de teste no DESTINO"
 Write-Host "   4. Verificar conectividade de rede e storage"
+if (-not $SyncStorage) {
+    Write-Host "   5. Sincronizar storage com -SyncStorage (se necessario)"
+}
 Write-Host "============================================"

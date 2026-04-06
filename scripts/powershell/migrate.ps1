@@ -43,6 +43,12 @@
 .PARAMETER DestinoVnetAddressSpace
     CIDR of the VNet in the destination. Optional; inherits from source.
 
+.PARAMETER DestinoStorageName
+    Custom name for the destination ADLS Gen2 storage account. Optional.
+
+.PARAMETER SyncStorage
+    Switch to enable ADLS Gen2 storage data synchronization.
+
 .PARAMETER SecretsFile
     JSON file with secret values for migration.
 
@@ -116,6 +122,10 @@ param(
 
     [string]$DestinoVnetAddressSpace = "",
 
+    [string]$DestinoStorageName = "",
+
+    [switch]$SyncStorage,
+
     [string]$SecretsFile = "",
 
     [string]$ExportDir = "",
@@ -176,6 +186,8 @@ Write-Host ""
 Write-Host "  OPCOES:"
 Write-Host "    Export Dir:     $ExportDir"
 Write-Host "    Secrets File:   $(if ($SecretsFile) { $SecretsFile } else { 'nao fornecido' })"
+Write-Host "    Storage Name:   $(if ($DestinoStorageName) { $DestinoStorageName } else { 'auto' })"
+Write-Host "    Sync Storage:   $SyncStorage"
 Write-Host "    Skip Infra:     $SkipInfra"
 Write-Host "    Skip Data:      $SkipData"
 Write-Host "    Dry Run:        $DryRun"
@@ -203,6 +215,7 @@ if ($DryRun) {
         if ($DestinoVnetName) { Write-Host "       -VnetName $DestinoVnetName" }
         if ($DestinoLocation) { Write-Host "       -Location $DestinoLocation" }
         if ($DestinoVnetAddressSpace) { Write-Host "       -VnetAddressSpace $DestinoVnetAddressSpace" }
+        if ($DestinoStorageName) { Write-Host "       -StorageName $DestinoStorageName" }
         Write-Host ""
     }
     if (-not $SkipData) {
@@ -212,6 +225,7 @@ if ($DryRun) {
         Write-Host "       -ProfileDestino $DestinoCliProfile"
         Write-Host "       -ExportDir $DataDir"
         if ($SecretsFile) { Write-Host "       -SecretsFile $SecretsFile" }
+        if ($SyncStorage) { Write-Host "       -SyncStorage" }
     }
     Write-Host ""
     Write-Host "  [DRY RUN] Nenhuma acao executada." -ForegroundColor Cyan
@@ -256,6 +270,7 @@ if (-not $SkipInfra) {
     if ($DestinoVnetName) { $createArgs["VnetName"] = $DestinoVnetName }
     if ($DestinoLocation) { $createArgs["Location"] = $DestinoLocation }
     if ($DestinoVnetAddressSpace) { $createArgs["VnetAddressSpace"] = $DestinoVnetAddressSpace }
+    if ($DestinoStorageName) { $createArgs["StorageName"] = $DestinoStorageName }
 
     & "$PSScriptRoot\02_create_destino_infra.ps1" @createArgs
 }
@@ -277,6 +292,7 @@ if (-not $SkipData) {
         ExportDir      = $DataDir
     }
     if ($SecretsFile) { $migrateArgs["SecretsFile"] = $SecretsFile }
+    if ($SyncStorage) { $migrateArgs["SyncStorage"] = $true }
 
     & "$PSScriptRoot\03_migrate_data.ps1" @migrateArgs
 }
@@ -309,4 +325,6 @@ Write-Host "    3. Executar um job de teste no DESTINO"
 Write-Host "    4. Configurar scheduling dos jobs"
 Write-Host "    5. Atualizar DNS/bookmarks para nova workspace"
 Write-Host "    6. Pausar jobs na ORIGEM apos validacao"
+Write-Host "    7. Validar dados no storage destino (se sincronizado)"
+Write-Host "    8. Atualizar mount points/external locations no DESTINO"
 Write-Host "################################################################"

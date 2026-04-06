@@ -64,7 +64,9 @@ param(
 
     [string]$Location = "",
 
-    [string]$VnetAddressSpace = ""
+    [string]$VnetAddressSpace = "",
+
+    [string]$StorageName = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -99,6 +101,10 @@ $HasPe = $config.privateEndpoint.enabled
 $PeSubnetName = $config.privateEndpoint.subnet
 $PeGroupId = $config.privateEndpoint.groupId
 
+# Storage params
+$HasAdls = if ($config.storage -and $config.storage.hasAdlsGen2) { $config.storage.hasAdlsGen2 } else { $false }
+$HasAc = if ($config.storage -and $config.storage.hasAccessConnector) { $config.storage.hasAccessConnector } else { $false }
+
 # Defaults
 if (-not $Location) { $Location = $SrcLocation }
 if (-not $VnetAddressSpace) { $VnetAddressSpace = $SrcVnetCidr }
@@ -117,11 +123,11 @@ Write-Host "  Private Endpoint: $HasPe"
 Write-Host ""
 
 # ===================== SET SUBSCRIPTION =====================
-Write-Host "[1/8] Definindo subscription destino..."
+Write-Host "[1/10] Definindo subscription destino..."
 az account set --subscription $Subscription
 
 # ===================== RESOURCE GROUP =====================
-Write-Host "[2/8] Criando Resource Group: $ResourceGroup ..."
+Write-Host "[2/10] Criando Resource Group: $ResourceGroup ..."
 az group create `
     --name $ResourceGroup `
     --location $Location `
@@ -132,7 +138,7 @@ Write-Host "  Resource Group criado."
 # ===================== VNET + SUBNETS =====================
 $NsgName = ""
 if ($HasVnet) {
-    Write-Host "[3/8] Criando VNet: $VnetName ($VnetAddressSpace) ..."
+    Write-Host "[3/10] Criando VNet: $VnetName ($VnetAddressSpace) ..."
     az network vnet create `
         --resource-group $ResourceGroup `
         --name $VnetName `
@@ -143,7 +149,7 @@ if ($HasVnet) {
 
     # Recriar subnets com as mesmas configs
     $SubnetCount = $config.network.subnets.Count
-    Write-Host "[4/8] Criando $SubnetCount subnets..."
+    Write-Host "[4/10] Criando $SubnetCount subnets..."
 
     for ($i = 0; $i -lt $SubnetCount; $i++) {
         $snet = $config.network.subnets[$i]
@@ -171,7 +177,7 @@ if ($HasVnet) {
     }
 
     # ===================== NSG =====================
-    Write-Host "[5/8] Criando NSG..."
+    Write-Host "[5/10] Criando NSG..."
     $NsgName = "nsg-$WorkspaceName"
     az network nsg create `
         --resource-group $ResourceGroup `
@@ -197,13 +203,13 @@ if ($HasVnet) {
     }
 }
 else {
-    Write-Host "[3/8] Sem VNet injection na origem - pulando VNet..."
-    Write-Host "[4/8] Pulando subnets..."
-    Write-Host "[5/8] Pulando NSG..."
+    Write-Host "[3/10] Sem VNet injection na origem - pulando VNet..."
+    Write-Host "[4/10] Pulando subnets..."
+    Write-Host "[5/10] Pulando NSG..."
 }
 
 # ===================== WORKSPACE =====================
-Write-Host "[6/8] Criando Workspace Databricks: $WorkspaceName ..."
+Write-Host "[6/10] Criando Workspace Databricks: $WorkspaceName ..."
 Write-Host "  (Isso pode levar 5-10 minutos...)"
 
 $wsArgs = @(
@@ -246,11 +252,183 @@ $WsId = az databricks workspace show `
 
 Write-Host "  URL: https://$WsUrl"
 
+# ===================== ADLS GEN2 STORAGE ACCOUNT =====================
+$DestStorageAccounts = @()
+$DestAcName = ""
+
+if ($HasAdls) {
+    $storageAccountConfigs = $config.storage.storageAccounts
+    $storageCount = if ($storageAccountConfigs) { $storageAccountConfigs.Count } else { 0 }
+    Write-Host "[7/10] Criando $storageCount ADLS Gen2 Storage Account(s)..."
+
+    # Get workspace managed identity principal ID for role assignment
+    $wsIdentity = ""
+    try {
+        $wsIdentity = az databricks workspace show `
+            --resource-group $ResourceGroup `
+            --name $WorkspaceName `
+            --query identity.principalId -o tsv 2>$null
+    }
+    catch { }
+
+    for ($i = 0; $i -lt $storageCount; $i++) {
+        $saConfig = $storageAccountConfigs[$i]
+        $srcSaName = $saConfig.name
+        $saSku = $saConfig.sku
+        $saKind = $saConfig.kind
+        $saAccessTier = $saConfig.accessTier
+        $saNetworkAction = $saConfig.networkDefaultAction
+
+        # Determine destination storage account name
+        if ($StorageName -and $storageCount -eq 1) {
+            $newSaName = $StorageName
+        }
+        else {
+            # Generate a new name based on destination workspace (storage names must be 3-24 lowercase alphanum)
+            $sanitizedWs = ($WorkspaceName -replace '[^a-zA-Z0-9]', '').ToLower()
+            $newSaName = "${sanitizedWs}adls${i}"
+            if ($newSaName.Length -gt 24) { $newSaName = $newSaName.Substring(0, 24) }
+        }
+
+        Write-Host "  Criando storage account: $newSaName (source: $srcSaName)..."
+        az storage account create `
+            --name $newSaName `
+            --resource-group $ResourceGroup `
+            --location $Location `
+            --sku $saSku `
+            --kind $saKind `
+            --access-tier $saAccessTier `
+            --enable-hierarchical-namespace true `
+            --tags purpose=migration-destino source-storage=$srcSaName `
+            --output none
+        Write-Host "    Storage account criado: $newSaName"
+
+        $DestStorageAccounts += $newSaName
+
+        # Create the same containers as in the source
+        $containerList = $saConfig.containers
+        $containerCount = if ($containerList) { $containerList.Count } else { 0 }
+        Write-Host "    Criando $containerCount containers..."
+        foreach ($containerName in $containerList) {
+            try {
+                az storage container create `
+                    --name $containerName `
+                    --account-name $newSaName `
+                    --auth-mode login `
+                    --output none 2>$null
+            }
+            catch { }
+            Write-Host "      Container: $containerName"
+        }
+
+        # Configure storage firewall if source had one
+        if ($saNetworkAction -eq "Deny") {
+            Write-Host "    Configurando firewall (default-action: Deny)..."
+            az storage account update `
+                --name $newSaName `
+                --resource-group $ResourceGroup `
+                --default-action Deny `
+                --output none
+
+            # Allow access from the destination VNet subnets if VNet injection is used
+            if ($HasVnet) {
+                $subnetCount = $config.network.subnets.Count
+                for ($s = 0; $s -lt $subnetCount; $s++) {
+                    $snetName = $config.network.subnets[$s].name
+                    $subnetId = "/subscriptions/${Subscription}/resourceGroups/${ResourceGroup}/providers/Microsoft.Network/virtualNetworks/${VnetName}/subnets/${snetName}"
+                    try {
+                        az storage account network-rule add `
+                            --account-name $newSaName `
+                            --resource-group $ResourceGroup `
+                            --subnet $subnetId `
+                            --output none 2>$null
+                    }
+                    catch { }
+                    Write-Host "      VNet rule adicionada para subnet: $snetName"
+                }
+            }
+            Write-Host "    Firewall configurado."
+        }
+
+        # Assign Storage Blob Data Contributor role to workspace managed identity
+        if ($wsIdentity -and $wsIdentity -ne "null") {
+            $saResourceId = az storage account show `
+                --name $newSaName `
+                --resource-group $ResourceGroup `
+                --query id -o tsv
+            try {
+                az role assignment create `
+                    --assignee $wsIdentity `
+                    --role "Storage Blob Data Contributor" `
+                    --scope $saResourceId `
+                    --output none 2>$null
+            }
+            catch { }
+            Write-Host "    Role 'Storage Blob Data Contributor' atribuida ao workspace identity."
+        }
+    }
+}
+else {
+    Write-Host "[7/10] Sem ADLS Gen2 na origem - pulando storage..."
+}
+
+# ===================== ACCESS CONNECTOR FOR DATABRICKS =====================
+if ($HasAc -or $HasAdls) {
+    Write-Host "[8/10] Criando Access Connector para Databricks (Unity Catalog)..."
+    $DestAcName = "ac-$WorkspaceName"
+
+    try {
+        az resource create `
+            --resource-group $ResourceGroup `
+            --resource-type "Microsoft.Databricks/accessConnectors" `
+            --name $DestAcName `
+            --location $Location `
+            --properties '{}' `
+            --is-full-object false `
+            --output none 2>$null
+    }
+    catch { }
+    Write-Host "  Access Connector criado: $DestAcName"
+
+    # Assign Storage Blob Data Contributor role to the access connector identity
+    try {
+        $acIdentity = az resource show `
+            --resource-group $ResourceGroup `
+            --resource-type "Microsoft.Databricks/accessConnectors" `
+            --name $DestAcName `
+            --query identity.principalId -o tsv 2>$null
+    }
+    catch {
+        $acIdentity = ""
+    }
+
+    if ($acIdentity -and $acIdentity -ne "null") {
+        foreach ($saName in $DestStorageAccounts) {
+            $saResourceId = az storage account show `
+                --name $saName `
+                --resource-group $ResourceGroup `
+                --query id -o tsv
+            try {
+                az role assignment create `
+                    --assignee $acIdentity `
+                    --role "Storage Blob Data Contributor" `
+                    --scope $saResourceId `
+                    --output none 2>$null
+            }
+            catch { }
+            Write-Host "  Role 'Storage Blob Data Contributor' atribuida ao Access Connector em: $saName"
+        }
+    }
+}
+else {
+    Write-Host "[8/10] Sem Access Connector necessario - pulando..."
+}
+
 # ===================== PRIVATE ENDPOINT =====================
 $PeName = ""
 $DnsZone = ""
 if ($HasPe -and $HasVnet) {
-    Write-Host "[7/8] Criando Private Endpoint..."
+    Write-Host "[9/10] Criando Private Endpoint..."
 
     $PeName = "pe-$WorkspaceName"
     $PeConnName = "pe-conn-$WorkspaceName"
@@ -296,11 +474,11 @@ if ($HasPe -and $HasVnet) {
     Write-Host "  DNS Zone Group criada."
 }
 else {
-    Write-Host "[7/8] Sem Private Endpoint na origem - pulando..."
+    Write-Host "[9/10] Sem Private Endpoint na origem - pulando..."
 }
 
 # ===================== DATABRICKS CLI =====================
-Write-Host "[8/8] Configurando Databricks CLI (profile: $CliProfile) ..."
+Write-Host "[10/10] Configurando Databricks CLI (profile: $CliProfile) ..."
 try {
     databricks auth login --host "https://$WsUrl" --profile $CliProfile 2>$null
 }
@@ -330,6 +508,12 @@ if ($HasVnet) {
 if ($HasPe) {
     Write-Host " Private Endpoint:   $PeName"
     Write-Host " Private DNS:        $DnsZone"
+}
+if ($HasAdls) {
+    Write-Host " Storage Accounts:   $($DestStorageAccounts -join ', ')"
+}
+if ($DestAcName) {
+    Write-Host " Access Connector:   $DestAcName"
 }
 Write-Host " CLI Profile:        $CliProfile"
 Write-Host ""

@@ -13,6 +13,9 @@
 #       --profile-destino <profile> \
 #       [--export-dir <path>]
 #       [--secrets-file <path>]  # arquivo com valores dos secrets
+#       [--sync-storage]         # habilita sincronizacao de storage ADLS Gen2
+#       [--origem-storage-account <name>]   # storage account de origem
+#       [--destino-storage-account <name>]  # storage account de destino
 ###############################################################################
 set -euo pipefail
 
@@ -21,13 +24,19 @@ PROFILE_ORIGEM=""
 PROFILE_DESTINO=""
 EXPORT_DIR="./migration-export"
 SECRETS_FILE=""
+SYNC_STORAGE=false
+ORIGEM_STORAGE_ACCOUNT=""
+DESTINO_STORAGE_ACCOUNT=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --profile-origem)   PROFILE_ORIGEM="$2"; shift 2;;
-    --profile-destino)  PROFILE_DESTINO="$2"; shift 2;;
-    --export-dir)       EXPORT_DIR="$2"; shift 2;;
-    --secrets-file)     SECRETS_FILE="$2"; shift 2;;
+    --profile-origem)          PROFILE_ORIGEM="$2"; shift 2;;
+    --profile-destino)         PROFILE_DESTINO="$2"; shift 2;;
+    --export-dir)              EXPORT_DIR="$2"; shift 2;;
+    --secrets-file)            SECRETS_FILE="$2"; shift 2;;
+    --sync-storage)            SYNC_STORAGE=true; shift;;
+    --origem-storage-account)  ORIGEM_STORAGE_ACCOUNT="$2"; shift 2;;
+    --destino-storage-account) DESTINO_STORAGE_ACCOUNT="$2"; shift 2;;
     *) echo "Parametro desconhecido: $1"; exit 1;;
   esac
 done
@@ -48,7 +57,7 @@ echo "============================================"
 echo ""
 
 # ===================== VALIDAR CONECTIVIDADE =====================
-echo "[0/6] Validando conectividade..."
+echo "[0/8] Validando conectividade..."
 ORIGEM_HOST=$(databricks auth env --profile "$PROFILE_ORIGEM" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)['env']['DATABRICKS_HOST'])")
 DESTINO_HOST=$(databricks auth env --profile "$PROFILE_DESTINO" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)['env']['DATABRICKS_HOST'])")
 echo "  Origem:  $ORIGEM_HOST"
@@ -67,14 +76,14 @@ echo "============================================"
 echo " FASE 1: Migrar Notebooks"
 echo "============================================"
 
-echo "[1/6] Exportando notebooks da ORIGEM..."
+echo "[1/8] Exportando notebooks da ORIGEM..."
 databricks workspace export-dir / "$EXPORT_DIR/notebooks" \
   --profile "$PROFILE_ORIGEM" \
   --overwrite 2>&1 | tail -5
 NOTEBOOK_COUNT=$(find "$EXPORT_DIR/notebooks" -type f -name "*.py" -o -name "*.sql" -o -name "*.scala" -o -name "*.r" 2>/dev/null | wc -l | tr -d ' ')
 echo "  Exportados: $NOTEBOOK_COUNT notebooks"
 
-echo "[2/6] Importando notebooks no DESTINO..."
+echo "[2/8] Importando notebooks no DESTINO..."
 databricks workspace import-dir "$EXPORT_DIR/notebooks" / \
   --profile "$PROFILE_DESTINO" \
   --overwrite 2>&1 | tail -5
@@ -95,7 +104,7 @@ echo "============================================"
 echo " FASE 2: Migrar Secret Scopes"
 echo "============================================"
 
-echo "[3/6] Exportando secret scopes da ORIGEM..."
+echo "[3/8] Exportando secret scopes da ORIGEM..."
 databricks secrets list-scopes --profile "$PROFILE_ORIGEM" --output json > "$EXPORT_DIR/secrets/scopes.json" 2>/dev/null
 
 SCOPE_COUNT=$(python3 -c "
@@ -193,7 +202,7 @@ echo "============================================"
 echo " FASE 3: Migrar Jobs"
 echo "============================================"
 
-echo "[4/6] Exportando jobs da ORIGEM..."
+echo "[4/8] Exportando jobs da ORIGEM..."
 databricks jobs list --profile "$PROFILE_ORIGEM" --output json > "$EXPORT_DIR/jobs/jobs_list.json" 2>/dev/null
 
 JOB_COUNT=$(python3 -c "
@@ -218,7 +227,7 @@ if isinstance(jobs, list):
         print(j.get('job_id', ''))
 " 2>/dev/null)
 
-  echo "[5/6] Exportando definicoes completas dos jobs..."
+  echo "[5/8] Exportando definicoes completas dos jobs..."
   for job_id in $JOB_IDS; do
     if [[ -n "$job_id" ]]; then
       databricks jobs get "$job_id" --profile "$PROFILE_ORIGEM" --output json \
@@ -233,7 +242,7 @@ print(d.get('settings',{}).get('name', d.get('name','unknown')))
     fi
   done
 
-  echo "[6/6] Limpando e recriando jobs no DESTINO..."
+  echo "[6/8] Limpando e recriando jobs no DESTINO..."
   for job_id in $JOB_IDS; do
     if [[ -n "$job_id" && -f "$EXPORT_DIR/jobs/job_${job_id}.json" ]]; then
       # Limpar campos read-only e extrair settings
@@ -290,8 +299,131 @@ PYEOF
     fi
   done
 else
-  echo "[5/6] Nenhum job para exportar."
-  echo "[6/6] Pulando..."
+  echo "[5/8] Nenhum job para exportar."
+  echo "[6/8] Pulando..."
+fi
+
+###########################################################################
+# FASE 4: STORAGE SYNC (ADLS Gen2)
+###########################################################################
+STORAGE_SYNC_STATUS="Pulado (--sync-storage nao fornecido)"
+STORAGE_SYNC_BYTES=""
+
+if [[ "$SYNC_STORAGE" == "true" ]]; then
+  echo "============================================"
+  echo " FASE 4: Sincronizar Storage ADLS Gen2"
+  echo "============================================"
+
+  if [[ -z "$ORIGEM_STORAGE_ACCOUNT" || -z "$DESTINO_STORAGE_ACCOUNT" ]]; then
+    echo "  ERRO: --origem-storage-account e --destino-storage-account sao obrigatorios com --sync-storage"
+    echo "  Pulando sincronizacao de storage..."
+    STORAGE_SYNC_STATUS="Erro: parametros de storage nao fornecidos"
+  else
+    echo "[7/8] Listando containers e tamanhos na ORIGEM..."
+    mkdir -p "$EXPORT_DIR/storage"
+
+    # List containers in source
+    CONTAINERS=$(az storage container list \
+      --account-name "$ORIGEM_STORAGE_ACCOUNT" \
+      --auth-mode login \
+      --query "[].name" -o tsv 2>/dev/null || true)
+
+    if [[ -z "$CONTAINERS" ]]; then
+      echo "  Nenhum container encontrado na storage de origem."
+      STORAGE_SYNC_STATUS="Nenhum container encontrado"
+    else
+      echo "  Containers encontrados:"
+      TOTAL_SIZE=0
+      for container in $CONTAINERS; do
+        # Get container size (best effort)
+        SIZE=$(az storage blob list \
+          --account-name "$ORIGEM_STORAGE_ACCOUNT" \
+          --container-name "$container" \
+          --auth-mode login \
+          --query "[].properties.contentLength" -o tsv 2>/dev/null | \
+          awk '{s+=$1} END {print s+0}' || echo "0")
+        SIZE_MB=$(( SIZE / 1024 / 1024 ))
+        echo "    $container: ${SIZE_MB} MB"
+        TOTAL_SIZE=$(( TOTAL_SIZE + SIZE ))
+      done
+      TOTAL_SIZE_GB=$(( TOTAL_SIZE / 1024 / 1024 / 1024 ))
+      echo "  Total estimado: ${TOTAL_SIZE_GB} GB"
+      echo ""
+
+      echo "[8/8] Sincronizando dados com azcopy..."
+      echo "  Origem:  $ORIGEM_STORAGE_ACCOUNT"
+      echo "  Destino: $DESTINO_STORAGE_ACCOUNT"
+      echo ""
+
+      # Determine authentication method
+      # Try Azure AD auth first (azcopy login), fallback to SAS tokens
+      AZCOPY_AUTH="aad"
+      if ! azcopy list "https://${ORIGEM_STORAGE_ACCOUNT}.blob.core.windows.net/" > /dev/null 2>&1; then
+        echo "  Azure AD auth nao disponivel para azcopy, tentando SAS tokens..."
+        AZCOPY_AUTH="sas"
+
+        # Generate SAS tokens for source (read) and destination (write)
+        SAS_EXPIRY=$(date -u -d "+24 hours" '+%Y-%m-%dT%H:%MZ' 2>/dev/null || date -u -v+24H '+%Y-%m-%dT%H:%MZ')
+
+        ORIGEM_SAS=$(az storage account generate-sas \
+          --account-name "$ORIGEM_STORAGE_ACCOUNT" \
+          --permissions rl \
+          --services b \
+          --resource-types co \
+          --expiry "$SAS_EXPIRY" \
+          -o tsv 2>/dev/null || true)
+
+        DESTINO_SAS=$(az storage account generate-sas \
+          --account-name "$DESTINO_STORAGE_ACCOUNT" \
+          --permissions rwdlac \
+          --services b \
+          --resource-types co \
+          --expiry "$SAS_EXPIRY" \
+          -o tsv 2>/dev/null || true)
+
+        if [[ -z "$ORIGEM_SAS" || -z "$DESTINO_SAS" ]]; then
+          echo "  ERRO: Nao foi possivel gerar SAS tokens. Verifique permissoes."
+          STORAGE_SYNC_STATUS="Erro: falha ao gerar SAS tokens"
+          SYNC_STORAGE=false
+        fi
+      fi
+
+      if [[ "$SYNC_STORAGE" == "true" ]]; then
+        SYNC_ERRORS=0
+        SYNC_SUCCESS=0
+
+        for container in $CONTAINERS; do
+          echo ""
+          echo "  Sincronizando container: $container ..."
+
+          if [[ "$AZCOPY_AUTH" == "aad" ]]; then
+            SRC_URL="https://${ORIGEM_STORAGE_ACCOUNT}.blob.core.windows.net/${container}"
+            DST_URL="https://${DESTINO_STORAGE_ACCOUNT}.blob.core.windows.net/${container}"
+          else
+            SRC_URL="https://${ORIGEM_STORAGE_ACCOUNT}.blob.core.windows.net/${container}?${ORIGEM_SAS}"
+            DST_URL="https://${DESTINO_STORAGE_ACCOUNT}.blob.core.windows.net/${container}?${DESTINO_SAS}"
+          fi
+
+          if azcopy sync "$SRC_URL" "$DST_URL" --recursive=true 2>&1 | tee -a "$EXPORT_DIR/storage/azcopy_${container}.log" | tail -5; then
+            SYNC_SUCCESS=$((SYNC_SUCCESS + 1))
+            echo "    Container $container: OK"
+          else
+            SYNC_ERRORS=$((SYNC_ERRORS + 1))
+            echo "    Container $container: ERRO (ver log: $EXPORT_DIR/storage/azcopy_${container}.log)"
+          fi
+        done
+
+        STORAGE_SYNC_STATUS="Completo (sucesso: $SYNC_SUCCESS, erros: $SYNC_ERRORS)"
+        STORAGE_SYNC_BYTES="${TOTAL_SIZE_GB} GB transferidos (estimado)"
+      fi
+    fi
+  fi
+else
+  echo ""
+  echo "============================================"
+  echo " FASE 4: Sincronizar Storage ADLS Gen2"
+  echo "============================================"
+  echo "  Pulado (use --sync-storage para habilitar)"
 fi
 
 ###########################################################################
@@ -323,6 +455,17 @@ cat "$EXPORT_DIR/jobs/job_id_mapping.csv" | while IFS=',' read -r old new name; 
 done
 fi
 echo ""
+echo " STORAGE SYNC:"
+echo "   Status: $STORAGE_SYNC_STATUS"
+if [[ -n "$STORAGE_SYNC_BYTES" ]]; then
+echo "   Volume: $STORAGE_SYNC_BYTES"
+fi
+if [[ "$SYNC_STORAGE" == "true" && -n "$ORIGEM_STORAGE_ACCOUNT" ]]; then
+echo "   Origem:  $ORIGEM_STORAGE_ACCOUNT"
+echo "   Destino: $DESTINO_STORAGE_ACCOUNT"
+echo "   Logs:    $EXPORT_DIR/storage/"
+fi
+echo ""
 echo " Arquivos exportados em: $EXPORT_DIR/"
 echo ""
 echo " Proximos passos:"
@@ -330,4 +473,7 @@ echo "   1. Atualizar valores de secrets com os valores reais"
 echo "   2. Validar notebooks importados no DESTINO"
 echo "   3. Executar um job de teste no DESTINO"
 echo "   4. Verificar conectividade de rede e storage"
+if [[ "$SYNC_STORAGE" != "true" ]]; then
+echo "   5. Sincronizar storage com --sync-storage (se necessario)"
+fi
 echo "============================================"
